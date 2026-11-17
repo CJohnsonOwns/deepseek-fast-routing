@@ -1,0 +1,512 @@
+diff --git a/src/dsv41/ds4_model.cu b/src/dsv41/ds4_model.cu
+index 91835ed..d99d3fd 100644
+--- a/src/dsv41/ds4_model.cu
++++ b/src/dsv41/ds4_model.cu
+@@ -756,6 +756,7 @@ struct Chunk {
+         const uint8_t* ram = nullptr;                  // its RAM-tier blob, copied into staging (not pinned there)
+         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
+         int64_t after = -1;                            // (layer-major) the items up to this one read first
++        bool store_put = false;                        // (local patch, DS4_PROMPT_KEEP) `keep` is a RAM-store slot: put_done once read
+         std::atomic<int> left{0};                      // parts still being read
+         std::atomic<bool> bad{false};
+     };
+@@ -797,6 +798,7 @@ struct Chunk {
+     std::vector<int> lc_of;                  // expert -> its slot (-1: none)
+     std::vector<int64_t> lc_writer;          // slot -> the item reading its expert into it
+     uint64_t it_lc = 0;                      // items taken from the layer cache
++    uint64_t it_kept = 0;                    // (local patch, DS4_PROMPT_KEEP) items read from the files and kept in the RAM store
+ };
+ 
+ // the states a run of chunks keeps on the way, at most: the restore points inside it (feed_marks) and the checkpoint
+@@ -1487,9 +1489,247 @@ struct Model::Impl {
+         if (share <= 0.02) return skip_auto_off("under 2%", share);
+         if (a.since - a.low_at >= disk_skip_settle) return skip_auto_off("no longer falling", share);
+     }
++    // DS4_EXPERT_MIX=file (fast-routing patch: the expert switchboard): offsets added to each layer's routing bias, the
++    // number route_kernel adds to an expert's score only to choose the top k (its weight still comes from the unbiased
++    // score).  -1e30 never picks the expert (off), +1e30 always picks it (on), anything between nudges it.  The file:
++    // "XMIX", u32 generation, u16 layers, u16 experts, layers x experts f32 (layer = index in L, as DS4_TRACE writes it).
++    // Read at each request and at most every 250 ms while writing; a new generation is copied to the GPU between tokens.
++    std::vector<std::vector<float>> mix_orig, mix_orig_vl;   // (the model's own biases, kept the first time a mix applies)
++    uint32_t mix_gen = 0;
++    std::chrono::steady_clock::time_point mix_seen{};
++    void expert_mix_poll(bool force) {
++        static const char* path = std::getenv("DS4_EXPERT_MIX");
++        if (path == nullptr || *path == 0) return;
++        const auto now = std::chrono::steady_clock::now();
++        if (!force && now - mix_seen < std::chrono::milliseconds(250)) return;
++        mix_seen = now;
++        std::FILE* f = std::fopen(path, "rb");
++        if (f == nullptr) return;
++        char magic[4];
++        uint32_t gen = 0;
++        uint16_t dims[2] = {0, 0};
++        if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "XMIX", 4) != 0 || std::fread(&gen, 4, 1, f) != 1 ||
++            gen == mix_gen || std::fread(dims, 2, 2, f) != 2) {
++            std::fclose(f);
++            return;
++        }
++        const size_t nl = dims[0], ne = dims[1];
++        std::vector<float> off(nl * ne, 0.0f);
++        const bool ok = nl > 0 && ne > 0 && std::fread(off.data(), 4, off.size(), f) == off.size();
++        std::fclose(f);
++        if (!ok) return;   // (a half-written file: the next look reads it whole)
++        int dev0 = 0;
++        (void) cudaGetDevice(&dev0);
++#define MIXCK(call)                                                                       \
++        do {                                                                              \
++            const cudaError_t e_ = (call);                                                \
++            if (e_ != cudaSuccess) {                                                      \
++                std::fprintf(stderr, "ds4: expert mix: %s\n", cudaGetErrorString(e_));       \
++                cudaSetDevice(dev0);                                                      \
++                return;                                                                   \
++            }                                                                             \
++        } while (0)
++        cache_route_restore();   // (DS4_CACHE_ROUTE: the mix is made from the model's own biases, never from a bonus)
++        if (mix_orig.empty()) {
++            mix_orig.resize(L.size());
++            mix_orig_vl.resize(L.size());
++            for (size_t li = 0; li < L.size(); ++li) {
++                const Layer& l = L[li];
++                if (l.mtp || l.gate_bias == nullptr || l.dev < 0 || (size_t) l.dev >= devs.size()) continue;
++                cudaSetDevice(devs[(size_t) l.dev].id);
++                mix_orig[li].resize((size_t) l.n_exp);
++                MIXCK(cudaMemcpy(mix_orig[li].data(), l.gate_bias, (size_t) l.n_exp * 4, cudaMemcpyDeviceToHost));
++                if (l.gate_bias_vl != nullptr) {
++                    mix_orig_vl[li].resize((size_t) l.n_exp);
++                    MIXCK(cudaMemcpy(mix_orig_vl[li].data(), l.gate_bias_vl, (size_t) l.n_exp * 4, cudaMemcpyDeviceToHost));
++                }
++            }
++        }
++        int changed = 0;
++        std::vector<float> b;
++        for (size_t li = 0; li < L.size(); ++li) {
++            Layer& l = L[li];
++            if (l.mtp || mix_orig[li].empty()) continue;
++            for (int pass = 0; pass < 2; ++pass) {
++                const std::vector<float>& o0 = pass == 0 ? mix_orig[li] : mix_orig_vl[li];
++                if (o0.empty()) continue;
++                b = o0;
++                for (int e = 0; e < l.n_exp; ++e) {
++                    const float v = li < nl && (size_t) e < ne ? off[li * ne + (size_t) e] : 0.0f;
++                    if (std::isfinite(v) && v != 0.0f) b[(size_t) e] = std::max(-1e30f, std::min(1e30f, o0[(size_t) e] + v)), changed += pass == 0;
++                }
++                for (size_t m = 0; m <= l.mates.size(); ++m) {   // (each group member keeps its own copy)
++                    Layer& lm = member(l, (int) m);
++                    float* dst = pass == 0 ? lm.gate_bias : lm.gate_bias_vl;
++                    if (dst != nullptr && lm.dev >= 0 && (size_t) lm.dev < devs.size()) {
++                        cudaSetDevice(devs[(size_t) lm.dev].id);
++                        MIXCK(cudaMemcpy(dst, b.data(), b.size() * 4, cudaMemcpyHostToDevice));
++                    }
++                }
++            }
++        }
++#undef MIXCK
++        cudaSetDevice(dev0);
++        mix_gen = gen;
++        ca_base.clear();   // (DS4_CACHE_ROUTE: its base is the new mix, read back at its next apply)
++        std::fprintf(stderr, "ds4: expert mix %u applied (%d experts changed)\n", gen, changed);
++    }
++
++    // DS4_CACHE_ROUTE=b (fast-routing patch; CHANGES THE ANSWERS; unset or 0 = off): cache-aware routing on the
++    // decode path.  Each layer's routing bias (the number route_kernel adds to an expert's score only to choose the top
++    // k; the pick's weight still comes from its unbiased score) gets +b for every expert that needs no SSD read now: in
++    // VRAM (slot), in the RAM tier, or ready in the RAM store (--ssd-cache).  A cold expert then loses a close call to
++    // a warm one; a clear winner still wins.  Related: Mixture of Cache-Conditional Experts (arXiv 2412.00099) and
++    // Edge0's prediction-as-routing (arXiv 2609.18063), here for DeepSeek, without training.  Scores are
++    // sqrt(softplus(logit)), about 0.5 to 3, so b is a small number: 0.02 to 0.1 to try.
++    //   DS4_CACHE_ROUTE_EVERY=n (4): the warm sets are looked at, and changed layers' biases uploaded, every n tokens
++    //   DS4_CACHE_ROUTE_FROM=l (0): only layers from l on
++    //   DS4_CACHE_ROUTE_LOG=1: a line per request with the uploads and the warm share of the CPU lane's picks
++    //   DS4_CACHE_ROUTE_VRAM=v (0): an extra +v for experts in VRAM (they skip the CPU lane's expert math as well)
++    //   DS4_CACHE_ROUTE_STICKY=s (0): an extra +s for the experts this layer picked for the previous word (words
++    //     reuse experts; it also makes the lookahead's guesses land).  With s > 0 the biases are refreshed every word.
++    //   DS4_CACHE_ROUTE_CTL=file: "b v s" (three numbers) read before each request, replacing the three values, so a
++    //     bench or a front end can change them without a reload (a missing or bad file changes nothing)
++    // Prompts (chunks and prompt windows) route with the unmodified biases: the bonus is taken out before them.
++    float ca_bonus = env_f("DS4_CACHE_ROUTE", 0.0f);
++    float ca_vram = env_f("DS4_CACHE_ROUTE_VRAM", 0.0f);
++    float ca_sticky = env_f("DS4_CACHE_ROUTE_STICKY", 0.0f);
++    const int ca_every = std::max(1, (int) env_f("DS4_CACHE_ROUTE_EVERY", 4.0f));
++    const int ca_from = std::max(0, (int) env_f("DS4_CACHE_ROUTE_FROM", 0.0f));
++    const bool ca_log = env_f("DS4_CACHE_ROUTE_LOG", 0.0f) != 0.0f;
++    bool ca_any() const { return ca_bonus > 0.0f || ca_vram > 0.0f || ca_sticky > 0.0f; }
++    std::vector<std::vector<float>> ca_base;     // per layer: its bias without the bonus (the model's own + any mix)
++    std::vector<std::vector<float>> ca_sent;     // per layer: the bias the device has now (empty: the base)
++    float* ca_pin[2] = {nullptr, nullptr};       // pinned upload buffers (layers x 1024), used in turn
++    int ca_buf = 0;
++    bool ca_on = false;                          // the device biases carry the bonus now
++    int ca_prompt = 0;                           // >0: inside a prompt's windows (no bonus)
++    uint64_t ca_tick = 0, ca_uploads = 0;
++    std::atomic<int64_t> ca_picks{0}, ca_cold{0};   // (the serve lane) CPU-lane picks, of them not warm
++    std::unique_ptr<std::atomic<int>[]> ca_prev;    // (the serve lane writes) layers x kPicks: the last word's picks
++    void cache_route_ctl() {   // (between requests) DS4_CACHE_ROUTE_CTL
++        static const char* path = std::getenv("DS4_CACHE_ROUTE_CTL");
++        if (path == nullptr || *path == 0) return;
++        std::FILE* f = std::fopen(path, "r");
++        if (f == nullptr) return;
++        float b = 0, v = 0, s = 0;
++        const int n = std::fscanf(f, "%f %f %f", &b, &v, &s);
++        std::fclose(f);
++        if (n != 3 || !std::isfinite(b) || !std::isfinite(v) || !std::isfinite(s) || b < 0 || v < 0 || s < 0 || b > 1 || v > 1 || s > 1) return;
++        if (b == ca_bonus && v == ca_vram && s == ca_sticky) return;
++        ca_bonus = b, ca_vram = v, ca_sticky = s;
++        std::fprintf(stderr, "ds4: cache route set: +%.3f warm, +%.3f VRAM, +%.3f sticky\n", b, v, s);
++    }
++    bool ca_warm_now(const Layer& l, int e) const {
++        if (l.slot[(size_t) e] >= 0) return true;
++        if (!l.ram.empty() && l.ram[(size_t) e] >= 0) return true;
++        return store && store->find(l.il, e) >= 0;
++    }
++    bool ca_upload(Layer& l, const float* b) {
++        for (size_t m = 0; m <= l.mates.size(); ++m) {   // (each group member keeps its own copy)
++            Layer& lm = member(l, (int) m);
++            if (lm.gate_bias == nullptr || lm.dev < 0 || (size_t) lm.dev >= devs.size()) continue;
++            Dev& d = devs[(size_t) lm.dev];
++            cudaSetDevice(d.id);
++            const cudaError_t e = cudaMemcpyAsync(lm.gate_bias, b, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, d.st);
++            if (e != cudaSuccess) {
++                std::fprintf(stderr, "ds4: cache route: %s (off)\n", cudaGetErrorString(e));
++                return false;
++            }
++        }
++        return true;
++    }
++    void cache_route_restore() {   // the biases without the bonus (before a prompt, before a mix is made)
++        if (!ca_on) return;
++        int dev0 = 0;
++        (void) cudaGetDevice(&dev0);
++        for (size_t li = 0; li < L.size() && li < ca_base.size(); ++li)
++            if (!ca_base[li].empty()) (void) ca_upload(L[li], ca_base[li].data());
++        for (Dev& d : devs) {
++            cudaSetDevice(d.id);
++            (void) cudaStreamSynchronize(d.st);   // (ca_base is pageable and lives on; the copies are done before it changes)
++        }
++        cudaSetDevice(dev0);
++        for (auto& w : ca_sent) w.clear();
++        ca_on = false;
++    }
++    void cache_route_apply() {   // (the decode path, between tokens)
++        if (!ca_any() || ca_prompt > 0) return;
++        if (ca_on && ca_sticky <= 0.0f && (ca_tick++ % (uint64_t) ca_every) != 0) return;
++        int dev0 = 0;
++        (void) cudaGetDevice(&dev0);
++        if (ca_pin[0] == nullptr) {
++            for (int i = 0; i < 2; ++i)
++                if (cudaMallocHost((void**) &ca_pin[i], L.size() * 1024 * 4) != cudaSuccess) {
++                    std::fprintf(stderr, "ds4: cache route: no pinned buffer (off)\n");
++                    ca_bonus = ca_vram = ca_sticky = 0.0f;
++                    return;
++                }
++            std::fprintf(stderr, "ds4: cache route on: +%.3f warm, +%.3f VRAM, +%.3f sticky, every %d tokens, layers from %d\n",
++                         ca_bonus, ca_vram, ca_sticky, ca_every, ca_from);
++        }
++        if (ca_base.empty()) {   // (read back once, and again after a mix changed them)
++            ca_base.assign(L.size(), {});
++            ca_sent.assign(L.size(), {});
++            for (size_t li = 0; li < L.size(); ++li) {
++                const Layer& l = L[li];
++                if (l.mtp || l.gate_bias == nullptr || l.dev < 0 || (size_t) l.dev >= devs.size() || l.n_exp > 1024) continue;
++                cudaSetDevice(devs[(size_t) l.dev].id);
++                ca_base[li].resize((size_t) l.n_exp);
++                if (cudaMemcpy(ca_base[li].data(), l.gate_bias, (size_t) l.n_exp * 4, cudaMemcpyDeviceToHost) != cudaSuccess)
++                    ca_base[li].clear();
++            }
++        }
++        float* pin = ca_pin[ca_buf];
++        ca_buf ^= 1;   // (the other buffer's copies were queued at least a token ago, and a token waits for them: done)
++        bool ok = true;
++        for (size_t li = (size_t) ca_from; li < L.size() && li < (size_t) g.nl && ok; ++li) {
++            Layer& l = L[li];
++            if (ca_base[li].empty()) continue;
++            float* b = pin + li * 1024;
++            for (int e = 0; e < l.n_exp; ++e) {
++                const bool vram = l.slot[(size_t) e] >= 0;
++                b[e] = ca_base[li][(size_t) e] + (ca_warm_now(l, e) ? ca_bonus : 0.0f) + (vram ? ca_vram : 0.0f);
++            }
++            if (ca_sticky > 0.0f && ca_prev)
++                for (int i = 0; i < kPicks; ++i) {
++                    const int e = ca_prev[li * kPicks + (size_t) i].load(std::memory_order_relaxed);
++                    if (e >= 0 && e < l.n_exp) b[e] += ca_sticky;
++                }
++            if (ca_on && ca_sent[li].size() == (size_t) l.n_exp && std::memcmp(ca_sent[li].data(), b, (size_t) l.n_exp * 4) == 0)
++                continue;
++            ok = ca_upload(l, b);
++            ca_sent[li].assign(b, b + l.n_exp);
++            ++ca_uploads;
++        }
++        cudaSetDevice(dev0);
++        if (!ok) {
++            ca_on = true;
++            cache_route_restore();
++            ca_bonus = ca_vram = ca_sticky = 0.0f;
++            return;
++        }
++        ca_on = true;
++    }
++    void cache_route_report() {   // (DS4_CACHE_ROUTE_LOG, between requests)
++        if (!ca_log) return;
++        const int64_t p = ca_picks.exchange(0), c = ca_cold.exchange(0);
++        std::fprintf(stderr, "ds4: cache route: %llu layer uploads; CPU-lane picks %lld, cold %lld (%.1f%%)\n",
++                     (unsigned long long) ca_uploads, (long long) p, (long long) c, p > 0 ? 100.0 * (double) c / (double) p : 0.0);
++        ca_uploads = 0;
++    }
++
+     // between requests (the serve loop, the CLI's prompt): the switch back on, when the page cache lost most of what
+     // the last answer left in it
+     void begin_request() {
++        expert_mix_poll(true);
++        cache_route_report();
++        cache_route_restore();
++        if (!ca_prev) {   // (here, between requests, while the serve lane is idle; it only reads the pointer while decoding)
++            ca_prev.reset(new std::atomic<int>[L.size() * kPicks]);
++            for (size_t i = 0; i < L.size() * kPicks; ++i) ca_prev[i].store(-1, std::memory_order_relaxed);
++        }
++        cache_route_ctl();
+         if (!disk_skip_auto) return;
+         SkipAuto& a = sk_auto;
+         ++a.requests;
+@@ -4626,6 +4866,19 @@ struct Model::Impl {
+                 it.after = (int64_t) c.lc_first - 1;
+             }
+         }
++        {   // (local patch) DS4_PROMPT_KEEP=1: an expert the prompt reads from the files is kept in the RAM store as well (the
++            // read's bytes copied into a store slot by the reader), so the answer that follows finds the prompt's experts
++            // in RAM instead of reading them from the SSD again
++            static const bool prompt_keep = std::getenv("DS4_PROMPT_KEEP") != nullptr && std::atoi(std::getenv("DS4_PROMPT_KEEP")) != 0;
++            if (prompt_keep && !in_ram && !hit && it.keep == nullptr && store && l.nm == 1 && !c.direct) {
++                uint8_t* slot = store->put_begin(l.il, e);
++                if (slot != nullptr) {
++                    it.keep = slot;
++                    it.store_put = true;
++                    ++c.it_kept;
++                }
++            }
++        }
+         if (c.direct && l.nm == 1 && !(in_ram && copy_mode)) {   // (the ring slot is the destination: filled by flow_pump when its turn comes)
+             it.direct = true;
+             it.stage = -1;
+@@ -4859,6 +5112,10 @@ struct Model::Impl {
+         while (c.n_dma < c.n_read && c.n_dma < c.n_comp + R) {
+             Chunk::Item& it = fit(c, c.n_dma);
+             if (it.left.load(std::memory_order_acquire) != 0) break;
++            if (it.store_put) {   // (local patch, DS4_PROMPT_KEEP: the store slot holds the read's copy now)
++                store->put_done(it.il, it.e, !it.bad.load(std::memory_order_acquire));
++                it.store_put = false;
++            }
+             if (it.bad.load(std::memory_order_acquire)) {
+                 err = "reading layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) +
+                       " from the model's files failed";
+@@ -9471,6 +9728,8 @@ struct Model::Impl {
+                             if (r.ids[t][i] >= 0 && r.ids[t][i] < l.n_exp) wsum += r.w[t][i];
+                     for (int i = 0; i < l.k_exp; ++i) {
+                         const int e = r.ids[t][i];
++                        if (T == 1 && ca_prev && li < g.nl && i < kPicks)   // (DS4_CACHE_ROUTE_STICKY: this word's picks)
++                            ca_prev[(size_t) li * kPicks + (size_t) i].store(e, std::memory_order_relaxed);
+                         if (e < 0 || e >= l.n_exp) continue;
+                         ++pr[e];
+                         l.heat[(size_t) e] += 1.0f;
+@@ -9485,6 +9744,10 @@ struct Model::Impl {
+                         if (l.rc_n > 0 && l.slot[(size_t) e] >= l.rc_base && l.slot[(size_t) e] < l.rc_base + l.rc_n)
+                             l.rc_stamp[(size_t) (l.slot[(size_t) e] - l.rc_base)] = rc_clock.load(std::memory_order_relaxed);
+                         if (l.slot[(size_t) e] < 0) {
++                            if (ca_log && T == 1) {   // (DS4_CACHE_ROUTE_LOG: the warm share)
++                                ca_picks.fetch_add(1, std::memory_order_relaxed);
++                                if (!ca_warm_now(l, e)) ca_cold.fetch_add(1, std::memory_order_relaxed);
++                            }
+                             l.cpu_hits.push_back(e);
+                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
+                                 store->touch(li, e);
+@@ -12057,7 +12320,7 @@ struct Model::Impl {
+             c.fl_cut_r = run.cut_r;
+             c.spec_k = c.spec_il = -1;
+             c.wait_ms = 0;
+-            c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = 0;
++            c.it_file = c.it_ram = c.it_spec = c.it_spec_unused = c.it_lc = c.it_kept = 0;
+             c.lc_il = -1;
+             c.lc_used = 0;
+             c.lc_first = c.lc_chk = 0;
+@@ -12523,10 +12786,13 @@ struct Model::Impl {
+     // n tokens through windows of 16, the last one's logits_rows rows of logits
+     bool feed_windows(const int* tokens, int n, int logits_rows, std::string& err) {
+         logits_all = false;
++        cache_route_restore();   // (DS4_CACHE_ROUTE: a prompt routes as the model does)
++        ++ca_prompt;
+         for (int a = 0; a < n; a += kWin) {
+             const int T = std::min(kWin, n - a);
+-            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, err)) return false;
++            if (!forward(tokens + a, T, a + T == n ? logits_rows : 0, err)) return --ca_prompt, false;
+         }
++        --ca_prompt;
+         return true;
+     }
+     // the picked path took ms: the flow's predictions for the prompt's size class scaled by what it really takes (taken
+@@ -12896,6 +13162,7 @@ struct Model::Impl {
+     // a shared start), each kept from what the layers kept of it on the way - as mark() at that position would keep it
+     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1, int after = 0,
+                         const std::vector<std::pair<int64_t, bool>>* inner = nullptr) {
++        cache_route_restore();   // (DS4_CACHE_ROUTE: a prompt routes as the model does)
+         if (inner != nullptr && inner->size() + 1 > (size_t) kSnapN) {
+             err = "forward_chunks: restore points a run cannot keep";
+             return false;
+@@ -13156,6 +13423,9 @@ struct Model::Impl {
+                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
+                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
+                              (unsigned long long) c.it_spec_unused, c.wait_ms, dbgs);
++                if (c.it_kept > 0)
++                    std::fprintf(stderr, "ds4 prompt stream: %llu of the experts read from the files kept in the RAM store (DS4_PROMPT_KEEP)\n",
++                                 (unsigned long long) c.it_kept);
+             }
+         }
+         if (pm.on && run.T.size() == 1 && took == n) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
+@@ -13364,6 +13634,8 @@ struct Model::Impl {
+             ~BusyAll() { if (on) ds4_busy_end(); }
+         } busy_all;
+ #endif
++        expert_mix_poll(false);   // (DS4_EXPERT_MIX: a change made while the answer is being written)
++        cache_route_apply();      // (DS4_CACHE_ROUTE: decode windows only; feed_windows holds it off for prompts)
+         if (T < 1 || T > kWin) {
+             err = "a window of " + std::to_string(T) + " tokens";
+             return false;
+diff --git a/src/dsv41/ds4_pool.hpp b/src/dsv41/ds4_pool.hpp
+index f2d0975..441f332 100644
+--- a/src/dsv41/ds4_pool.hpp
++++ b/src/dsv41/ds4_pool.hpp
+@@ -153,7 +153,11 @@ public:
+         std::chrono::steady_clock::time_point pushed{};   // (DS4_IO_STATS: when it was queued)
+     };
+     explicit IoQueue(int n) {
+-        for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
++        // DS4_IO_LOW_READERS=<k> (local patch): only the first k readers take guesses (the low queue); the others wait for demand
++        // reads only, so a demand read never finds every reader busy with a guess that is already in flight
++        const char* lr = std::getenv("DS4_IO_LOW_READERS");
++        low_readers_ = lr != nullptr ? std::max(1, std::atoi(lr)) : n;   // (at least one: a guess a demand later waits on must be read)
++        for (int i = 0; i < n; ++i) th_.emplace_back([this, i] { loop(i); });
+     }
+     ~IoQueue() {
+         if (st_n_.load() > 0 && std::getenv("DS4_IO_STATS") != nullptr)
+@@ -177,9 +181,27 @@ public:
+                 (low ? ql_ : q_).back().pushed = std::chrono::steady_clock::now();
+             }
+         }
+-        if (n == 1) cv_.notify_one();
++        if (n == 1 && !(low && low_readers_ < (int) th_.size())) cv_.notify_one();   // (a guess wakes all: one that may take it)
+         else cv_.notify_all();
+     }
++    /// (local patch) a guess that turned out needed: its jobs still in the low queue move to the front of the demand queue
++    void promote(std::atomic<int>* left) {
++        bool moved = false;
++        {
++            std::lock_guard<std::mutex> lk(mu_);
++            for (auto it = ql_.begin(); it != ql_.end();) {
++                if (it->left == left) {
++                    Job j = *it;
++                    j.cancel = nullptr;
++                    q_.push_front(j);
++                    it = ql_.erase(it);
++                    moved = true;
++                } else
++                    ++it;
++            }
++        }
++        if (moved) cv_.notify_all();
++    }
+     void wait_any(int us) {
+         std::unique_lock<std::mutex> lk(done_mu_);
+         const uint64_t seen = done_;
+@@ -190,16 +212,17 @@ public:
+     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }
+ 
+ private:
+-    void loop() {
++    void loop(int idx) {
+ #if defined(_WIN32)
+         if (std::getenv("DS4_IO_PRIO") != nullptr) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);   // (a read in flight is the lane's critical path)
+ #endif
++        const bool low_ok = idx < low_readers_;
+         for (;;) {
+             Job j;
+             {
+                 std::unique_lock<std::mutex> lk(mu_);
+-                cv_.wait(lk, [&] { return quit_ || !q_.empty() || !ql_.empty(); });
+-                if (quit_ && q_.empty() && ql_.empty()) return;
++                cv_.wait(lk, [&] { return quit_ || !q_.empty() || (low_ok && !ql_.empty()); });
++                if (quit_ && q_.empty() && (!low_ok || ql_.empty())) return;
+                 std::deque<Job>& qq = q_.empty() ? ql_ : q_;
+                 j = qq.front();
+                 qq.pop_front();
+@@ -275,6 +298,7 @@ private:
+     std::deque<Job> q_, ql_;
+     uint64_t done_ = 0;
+     bool quit_ = false;
++    int low_readers_ = 0;
+     std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
+     std::atomic<uint64_t> st_n_{0}, st_q_{0}, st_r_{0}, st_m_{0}, st_b_{0};   // DS4_IO_STATS: jobs, queue wait / read / copy us, bytes
+ };
+diff --git a/src/dsv41/ds4_store.hpp b/src/dsv41/ds4_store.hpp
+index 1fb50b4..711e4b6 100644
+--- a/src/dsv41/ds4_store.hpp
++++ b/src/dsv41/ds4_store.hpp
+@@ -163,6 +163,7 @@ public:
+                 try_ready(sp);
+                 if (sp.state.load() == kReady && !sp.prefetch) st_.hits.fetch_add(1, std::memory_order_relaxed);
+                 if (sp.prefetch) st_.prefetch_used.fetch_add(1, std::memory_order_relaxed);
++                if (sp.prefetch && sp.state.load() == kLoading && promote_) io_->promote(&sp.left);   // (local patch: DS4_IO_PROMOTE)
+                 sp.prefetch = false;
+                 sp.pin++;
+                 sp.tick = ++clock_;
+@@ -479,9 +480,45 @@ private:
+         sp.state.store(kLoading, std::memory_order_release);
+         sp.bad.store(false);
+         sp.cancel.store(false);
+-        sp.left.store(3, std::memory_order_release);
+         where_[(size_t) layer][(size_t) e] = s;
+         const LayerGeo& g = geo_[(size_t) layer];
++        // DS4_STORE_PIECE_KB=<n> (local patch): each matrix read as pieces of about n KB (4 KB aligned in the file), each its own
++        // job, so one expert's bytes come in on many readers at once instead of three single-stream reads.  The pieces land in
++        // the reader's bounce buffer and are copied to their exact place (IoQueue's `exact` path): the same bytes, same layout.
++        static const uint64_t piece = [] {
++            const char* v = std::getenv("DS4_STORE_PIECE_KB");
++            const long long kb = v != nullptr ? std::atoll(v) : 0;
++            return kb > 0 ? (((uint64_t) kb << 10) + os::kDirectAlign - 1) & ~(uint64_t) (os::kDirectAlign - 1) : (uint64_t) 0;
++        }();
++        if (piece > 0) {
++            std::vector<IoQueue::Job> pj;
++            pj.reserve(64);
++            for (int r = 0; r < 3; ++r) {
++                const uint64_t off = g.off[r] + (uint64_t) e * g.stride[r], end = off + g.bytes[r];
++                uint8_t* fin = sp.base + g.tr[r];
++                for (uint64_t a = off; a < end;) {
++                    uint64_t b = ((a / os::kDirectAlign) * os::kDirectAlign) + piece;   // (piece ends on 4 KB file boundaries)
++                    if (b > end || end - b < piece / 4) b = end;                          // (no sliver at the end)
++                    IoQueue::Job j;
++                    j.fd = pfds_[(size_t) g.file[r]];
++                    j.dfd = dfds_[(size_t) g.file[r]];
++                    j.off = a;
++                    j.len = b - a;
++                    j.dst = fin + (a - off);
++                    j.exact = true;
++                    j.left = &sp.left;
++                    j.bad = &sp.bad;
++                    j.cancel = demand ? nullptr : &sp.cancel;
++                    pj.push_back(j);
++                    a = b;
++                }
++            }
++            sp.left.store((int) pj.size(), std::memory_order_release);
++            st_.bytes_read.fetch_add((int64_t) (g.bytes[0] + g.bytes[1] + g.bytes[2]), std::memory_order_relaxed);
++            io_->push(pj.data(), (int) pj.size(), !demand);
++            return s;
++        }
++        sp.left.store(3, std::memory_order_release);
+         IoQueue::Job jobs[3];
+         for (int r = 0; r < 3; ++r) {
+             const uint64_t off = g.off[r] + (uint64_t) e * g.stride[r];
+@@ -586,6 +623,7 @@ private:
+     uint64_t clock_ = 0;
+     std::mutex mu_;
+     std::unique_ptr<IoQueue> io_;
++    const bool promote_ = std::getenv("DS4_IO_PROMOTE") != nullptr && std::atoi(std::getenv("DS4_IO_PROMOTE")) != 0;
+     Stats st_;
+ };
+ 
